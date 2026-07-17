@@ -1,3 +1,12 @@
+# Bulk Comment Exporter
+
+A single-page Next.js app that takes a Facebook post-metrics CSV (or a pasted list of URLs),
+lets you filter/search it, submits the links to ExportComments.com in batches of 25, and lets
+you download every resulting export as one ZIP.
+
+See [`docs/README.md`](docs/README.md) for the full write-up: how the ExportComments.com API was
+reverse-engineered, what each feature does and why, and known limitations.
+
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
 ## Getting Started

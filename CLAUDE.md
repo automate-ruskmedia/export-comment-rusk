@@ -1,1 +1,1 @@
-@AGENTS.md
+just ha@AGENTS.md
