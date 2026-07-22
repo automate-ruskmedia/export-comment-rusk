@@ -11,6 +11,9 @@ const BATCH_SIZE = 25;
 // "settled" only in one of these; anything else (queueing, progress, in_progress, requeueing, or an
 // unknown future status) counts as still working, so we never call a run done prematurely.
 const TERMINAL_STATUSES = new Set(["done", "error", "stopped"]);
+// Safety net for the polling loop — if exports genuinely take longer than this, stop polling and
+// point the user at the recovery button instead of spinning forever.
+const MAX_POLL_MS = 6 * 60 * 60 * 1000;
 const ZIP_CONCURRENCY = 6;
 const TOKEN_STORAGE_KEY = "bulkExporter.token";
 const URLS_STORAGE_KEY = "bulkExporter.urlsRaw";
@@ -86,6 +89,7 @@ export default function BatchExporter() {
   const [liveExports, setLiveExports] = useState<LiveExport[]>([]);
   const [errorMsg, setErrorMsg] = useState("");
   const cancelRef = useRef(false);
+  const bookmarkletRef = useRef<HTMLAnchorElement>(null);
   const [csvError, setCsvError] = useState("");
   const [tokenCheck, setTokenCheck] = useState<"idle" | "checking" | "valid" | "invalid">("idle");
   const [tokenCheckMsg, setTokenCheckMsg] = useState("");
@@ -99,6 +103,15 @@ export default function BatchExporter() {
   const [searchScope, setSearchScope] = useState<SearchScope>("both");
   const [savedBatchIds, setSavedBatchIds] = useState<string[]>([]);
   const [recovering, setRecovering] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  // True once the user hand-edits the URLs textarea after a CSV load — search/filter must not
+  // silently overwrite those edits by regenerating urlsRaw from csvRows.
+  const [urlsManuallyEdited, setUrlsManuallyEdited] = useState(false);
+
+  function cancelRun() {
+    cancelRef.current = true;
+    setCancelling(true);
+  }
 
   // Shared by the manual "Check token" button and the pre-flight check before each batch.
   async function validateToken(authHeader: string): Promise<{ ok: boolean; message: string }> {
@@ -155,6 +168,15 @@ export default function BatchExporter() {
     localStorage.setItem(RESULTS_STORAGE_KEY, JSON.stringify(results));
   }, [results]);
 
+  // React blocks javascript: hrefs set via JSX props (XSS precaution) — set it on the raw DOM node
+  // instead, which bypasses that sanitizer since React never sees the value as a prop.
+  useEffect(() => {
+    if (bookmarkletRef.current) {
+      bookmarkletRef.current.href =
+        "javascript:(function(){var m=document.cookie.match(/jwt_token=([^;]*)/);if(!m)return alert('no token');var t=decodeURIComponent(m[1]);navigator.clipboard.writeText(t);alert('Copied: '+t.slice(0,24)+'…');})();";
+    }
+  }, []);
+
   async function resetSession() {
     const confirmed = await Swal.fire({
       title: "Reset session?",
@@ -184,6 +206,7 @@ export default function BatchExporter() {
     setOnlyWithComments(false);
     setSearchQuery("");
     setSearchScope("both");
+    setUrlsManuallyEdited(false);
 
     Swal.fire({ title: "Session reset", icon: "success", timer: 1200, showConfirmButton: false });
   }
@@ -196,6 +219,10 @@ export default function BatchExporter() {
       try {
         const text = (reader.result as string).replace(/^﻿/, "");
         const rows = parseCSV(text);
+        if (rows.length === 0) {
+          setCsvError("This CSV appears to be empty.");
+          return;
+        }
         const header = rows[0];
         const iLink = header.indexOf("Permalink");
         const iTitle = header.indexOf("Title");
@@ -235,6 +262,7 @@ export default function BatchExporter() {
         setCsvStats({ total: totalRows, unique: parsed.length, withComments });
         setOnlyWithComments(false);
         setSearchQuery("");
+        setUrlsManuallyEdited(false);
         setUrlsRaw(parsed.map((r) => r.permalink).join("\n"));
 
         Swal.fire({
@@ -252,6 +280,10 @@ export default function BatchExporter() {
   }
 
   function applyFilters(onlyWc: boolean, query: string, scope: SearchScope) {
+    if (urlsManuallyEdited) {
+      setErrorMsg('You\'ve manually edited the URL list — search/filter is disabled to avoid losing your edits. Reload the CSV to use search again.');
+      return;
+    }
     const filtered = filterCsvRows(csvRows, onlyWc, query, scope);
     setUrlsRaw(filtered.map((r) => r.permalink).join("\n"));
   }
@@ -287,6 +319,7 @@ export default function BatchExporter() {
     setProgress(null);
     setLiveExports([]);
     cancelRef.current = false;
+    setCancelling(false);
 
     if (!token.trim()) return setErrorMsg("Paste your bearer token first.");
     if (urls.length === 0) return setErrorMsg("Add at least one URL.");
@@ -305,7 +338,7 @@ export default function BatchExporter() {
     localStorage.setItem(BATCHIDS_STORAGE_KEY, "[]");
     setSavedBatchIds([]);
     for (let i = 0; i < batches.length; i++) {
-      if (cancelRef.current) return setStatus("idle");
+      if (cancelRef.current) { setCancelling(false); return setStatus("idle"); }
       setBatchIndex(i + 1);
       try {
         const res = await fetch("/api/batch-export", {
@@ -326,7 +359,7 @@ export default function BatchExporter() {
         setErrorMsg(`Batch ${i + 1}/${batches.length} submit failed: ${e.message}`);
         return;
       }
-      if (i < batches.length - 1) await sleep(2 * 60 * 1000);
+      if (i < batches.length - 1) await sleepCancelable(2 * 60 * 1000, cancelRef);
     }
 
     const batchIds = Object.keys(expectedByBatch);
@@ -339,10 +372,27 @@ export default function BatchExporter() {
     // 2. Poll the jobs list until every batch's exports are all out of a pending state.
     setStatus("polling");
     const totalExpected = Object.values(expectedByBatch).reduce((a, b) => a + b, 0);
+    const pollStart = Date.now();
     let allJobs: ResultItem[] = [];
     while (true) {
-      if (cancelRef.current) return setStatus("idle");
-      const byBatch = await fetchMyJobs(authHeader, new Set(batchIds));
+      if (cancelRef.current) { setCancelling(false); return setStatus("idle"); }
+      if (Date.now() - pollStart > MAX_POLL_MS) {
+        setStatus("error");
+        setErrorMsg(
+          "Still not finished after 6 hours of polling — stopping here. Your batches may still be processing on ExportComments; use \"Download completed exports\" below once they're done."
+        );
+        return;
+      }
+      let byBatch: Record<string, ResultItem[]>;
+      try {
+        byBatch = await fetchMyJobs(authHeader, new Set(batchIds));
+      } catch (e: any) {
+        setStatus("error");
+        setErrorMsg(
+          `Lost connection while polling: ${e.message}. Your batches are still processing on ExportComments — use "Download completed exports" below to check later.`
+        );
+        return;
+      }
       allJobs = batchIds.flatMap((id) => byBatch[id] ?? []);
       setResults([...allJobs]);
       const settled = allJobs.filter((j) => TERMINAL_STATUSES.has(j.status)).length;
@@ -357,7 +407,7 @@ export default function BatchExporter() {
         return mine.length >= expectedByBatch[id] && mine.every((e) => TERMINAL_STATUSES.has(e.status));
       });
       if (allBatchesDone) break;
-      await sleep(15000);
+      await sleepCancelable(15000, cancelRef);
     }
 
     // 3. Everything settled — download all successful exports as one combined ZIP.
@@ -448,18 +498,29 @@ export default function BatchExporter() {
     // Safari/Firefox fall back to buffering the finished zip as one Blob, still one copy instead
     // of the old approach's every-file-blob-plus-archive double buffering.
     if ("showSaveFilePicker" in window) {
+      let handle: any;
       try {
-        const handle = await (window as any).showSaveFilePicker({ suggestedName: fileName });
-        const writable = await handle.createWritable();
-        await zipResponse.body!.pipeTo(writable);
-        setZipping(false);
-        return;
+        handle = await (window as any).showSaveFilePicker({ suggestedName: fileName });
       } catch (e: any) {
         if (e?.name === "AbortError") {
           setZipping(false);
           return;
         }
-        // fall through to blob download on any other failure
+        handle = null; // couldn't get a file handle — fall through to the blob download below
+      }
+      if (handle) {
+        try {
+          const writable = await handle.createWritable();
+          await zipResponse.body!.pipeTo(writable);
+          setZipping(false);
+          return;
+        } catch (e: any) {
+          // The response stream is already consumed/errored at this point — it cannot be re-read
+          // via .blob() below, so report the failure instead of falling through to a broken stream.
+          setZipping(false);
+          setErrorMsg(`Failed to save ZIP: ${e.message || e}`);
+          return;
+        }
       }
     }
 
@@ -537,6 +598,7 @@ export default function BatchExporter() {
       <div className={styles.page} style={{ paddingTop: 32 }}>
         <div className={styles.card}>
           <header className={styles.header}>
+            <span className={styles.kicker}>Comment Export Console</span>
             <h1>Bulk Comment Exporter</h1>
             <p>Paste any number of URLs — they&apos;re split into batches of {BATCH_SIZE}, submitted 2 min apart, then auto-downloaded together as one ZIP when all finish. Keep this tab open.</p>
           </header>
@@ -551,8 +613,8 @@ export default function BatchExporter() {
               minHeight: 100,
               cursor: isBusy ? "default" : "pointer",
               textAlign: "center",
-              color: csvDragOver ? "#6366f1" : "#737373",
-              borderColor: csvDragOver ? "#6366f1" : undefined,
+              color: csvDragOver ? "var(--accent)" : "#948f84",
+              borderColor: csvDragOver ? "var(--accent)" : undefined,
               opacity: isBusy ? 0.6 : 1,
               marginBottom: 14,
             }}
@@ -640,24 +702,29 @@ export default function BatchExporter() {
                 </button>
               </div>
               {searchQuery && (
-                <button
-                  type="button"
-                  className={styles.button}
-                  style={{ width: "auto", padding: "4px 12px", fontSize: 12, marginBottom: 14, background: "transparent", color: "#525252", border: "1px solid #d4d4d4" }}
-                  disabled={isBusy}
-                  onClick={() => {
-                    setSearchQuery("");
-                    applyFilters(onlyWithComments, "", searchScope);
-                  }}
-                >
-                  Clear search
-                </button>
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+                  <span className={styles.count} style={{ fontSize: 12 }}>
+                    {urls.length} match{urls.length === 1 ? "" : "es"}
+                  </span>
+                  <button
+                    type="button"
+                    className={styles.button}
+                    style={{ width: "auto", padding: "4px 12px", fontSize: 12, background: "transparent", color: "#6b6860", border: "1px solid var(--line)" }}
+                    disabled={isBusy}
+                    onClick={() => {
+                      setSearchQuery("");
+                      applyFilters(onlyWithComments, "", searchScope);
+                    }}
+                  >
+                    Clear search
+                  </button>
+                </div>
               )}
 
               <button
                 type="button"
                 className={styles.button}
-                style={{ marginBottom: 18, background: "transparent", color: "#171717", border: "1px solid #d4d4d4" }}
+                style={{ marginBottom: 18, background: "transparent", color: "var(--foreground)", border: "1px solid var(--line)" }}
                 disabled={isBusy}
                 onClick={downloadCleanedCsv}
               >
@@ -666,8 +733,36 @@ export default function BatchExporter() {
             </>
           )}
 
-          <details style={{ marginBottom: 14, fontSize: 13, color: "#525252" }}>
+          <details style={{ marginBottom: 14, fontSize: 13, color: "#6b6860" }}>
             <summary style={{ cursor: "pointer", fontWeight: 600 }}>How do I get my token?</summary>
+
+            <p style={{ marginTop: 8, fontWeight: 600 }}>Quick way — drag this to your bookmarks bar:</p>
+            <p>
+              <a
+                ref={bookmarkletRef}
+                style={{
+                  display: "inline-block",
+                  padding: "6px 12px",
+                  borderRadius: 6,
+                  background: "var(--accent)",
+                  color: "#fff",
+                  fontWeight: 600,
+                  textDecoration: "none",
+                }}
+                onClick={(e) => e.preventDefault()}
+              >
+                📌 Get EC Token
+              </a>
+            </p>
+            <p>
+              Then, while logged in on{" "}
+              <a href="https://app.exportcomments.com/user/exports" target="_blank" rel="noreferrer">
+                app.exportcomments.com
+              </a>
+              , click that bookmark — it copies your token straight to your clipboard. Paste it below.
+            </p>
+
+            <p style={{ marginTop: 12, fontWeight: 600 }}>Manual way (DevTools):</p>
             <ol style={{ marginTop: 8, paddingLeft: 18, lineHeight: 1.7 }}>
               <li>
                 Go to{" "}
@@ -726,7 +821,10 @@ export default function BatchExporter() {
               className={styles.textarea}
               placeholder={"https://www.facebook.com/reel/...\nhttps://www.instagram.com/p/..."}
               value={urlsRaw}
-              onChange={(e) => setUrlsRaw(e.target.value)}
+              onChange={(e) => {
+                setUrlsRaw(e.target.value);
+                if (csvRows.length > 0) setUrlsManuallyEdited(true);
+              }}
               disabled={isBusy}
             />
           </label>
@@ -740,11 +838,23 @@ export default function BatchExporter() {
             {isBusy ? statusLabel() : "Submit"}
           </button>
 
+          {isBusy && (
+            <button
+              type="button"
+              className={styles.button}
+              style={{ marginTop: 10, background: "transparent", color: "#9a4319", border: "1px solid var(--line)" }}
+              onClick={cancelRun}
+              disabled={cancelling}
+            >
+              {cancelling ? "Cancelling…" : "Cancel"}
+            </button>
+          )}
+
           {savedBatchIds.length > 0 && !isBusy && (
             <button
               type="button"
               className={styles.button}
-              style={{ marginTop: 10, background: "transparent", color: "#6366f1", border: "1px solid #c7d2fe" }}
+              style={{ marginTop: 10, background: "transparent", color: "var(--accent)", border: "1px solid var(--line)" }}
               onClick={downloadSavedExports}
               disabled={recovering}
             >
@@ -816,4 +926,14 @@ export default function BatchExporter() {
 
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Sleeps in 1s steps, bailing out early if cancelRef flips true — so Cancel takes effect within
+// ~1s instead of waiting out the full 2min/15s gap.
+async function sleepCancelable(ms: number, cancelRef: { current: boolean }) {
+  const step = 1000;
+  for (let waited = 0; waited < ms; waited += step) {
+    if (cancelRef.current) return;
+    await sleep(Math.min(step, ms - waited));
+  }
 }
