@@ -264,59 +264,9 @@ export default function BatchExporter() {
   const batches = chunk(urls, BATCH_SIZE);
   const isBusy = status === "submitting" || status === "polling" || status === "fetching-links";
 
-  async function runOneBatch(batchUrls: string[], authHeader: string): Promise<ResultItem[]> {
-    const check = await validateToken(authHeader);
-    if (!check.ok) throw new Error(`Token check failed before batch: ${check.message}`);
-
-    setStatus("submitting");
-    const submitRes = await fetch("/api/batch-export", {
-      method: "POST",
-      headers: { Authorization: authHeader, "Content-Type": "application/json" },
-      body: JSON.stringify({ urls: batchUrls, options: { replies } }),
-    });
-    const submitData = await submitRes.json();
-    if (!submitRes.ok) throw new Error(submitData.error || `Submit failed (${submitRes.status})`);
-
-    const batchId: string = submitData.batchId;
-    setStatus("polling");
-    setProgress(null);
-
-    let final: any = null;
-    for (let i = 0; i < 60; i++) {
-      if (cancelRef.current) throw new Error("Cancelled");
-      await sleep(3000);
-      const r = await fetch(`/api/batch-export?batchId=${batchId}`, { headers: { Authorization: authHeader } });
-      const d = await r.json();
-      if (!r.ok) throw new Error(d.error || "Status check failed");
-      setProgress({ done: d.done, error: d.error, in_progress: d.in_progress, progress_pct: d.progress_pct });
-      setLiveExports(
-        (d.exports || []).map((e: any) => ({ url: e.url, status: e.status, totalExported: e.totalExported ?? 0 }))
-      );
-      if (d.is_complete) {
-        final = d;
-        break;
-      }
-    }
-    if (!final) throw new Error("Timed out waiting for batch to finish.");
-
-    setStatus("fetching-links");
-    const jobsRes = await fetch("/api/jobs?page=1&limit=25", { headers: { Authorization: authHeader } });
-    const jobsData = await jobsRes.json();
-    if (!jobsRes.ok) throw new Error(jobsData.error || "Failed to fetch download links");
-
-    setLiveExports([]);
-    return (jobsData.items || [])
-      .filter((it: any) => it.comment.batch_id === batchId)
-      .map((it: any) => ({
-        url: it.comment.url,
-        status: it.comment.status,
-        totalExported: it.comment.total_exported,
-        downloadUrl: it.comment.download_url ?? null,
-        fileName: it.comment.file_name ?? null,
-        error: it.comment.error ?? null,
-      }));
-  }
-
+  // Fire-and-forget: submit every batch to ExportComments spaced 5s apart, then stop. The jobs
+  // run in the background on their servers — no client-side polling to babysit or time out. Grab
+  // the finished files from your ExportComments dashboard once they're done.
   async function run() {
     setErrorMsg("");
     setResults([]);
@@ -330,21 +280,36 @@ export default function BatchExporter() {
     const authHeader = token.trim().startsWith("Bearer ") ? token.trim() : `Bearer ${token.trim()}`;
     setBatchCount(batches.length);
 
-    const allResults: ResultItem[] = [];
+    const check = await validateToken(authHeader);
+    if (!check.ok) return setErrorMsg(`Token check failed: ${check.message}`);
+
+    setStatus("submitting");
     for (let i = 0; i < batches.length; i++) {
+      if (cancelRef.current) return setStatus("idle");
       setBatchIndex(i + 1);
       try {
-        const items = await runOneBatch(batches[i], authHeader);
-        allResults.push(...items);
-        setResults([...allResults]);
+        const res = await fetch("/api/batch-export", {
+          method: "POST",
+          headers: { Authorization: authHeader, "Content-Type": "application/json" },
+          body: JSON.stringify({ urls: batches[i], options: { replies } }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || `Submit failed (${res.status})`);
+        if (i === 0) window.open("https://app.exportcomments.com/user/exports", "_blank", "noopener");
       } catch (e: any) {
         setStatus("error");
-        setErrorMsg(`Batch ${i + 1}/${batches.length} failed: ${e.message}`);
+        setErrorMsg(`Batch ${i + 1}/${batches.length} submit failed: ${e.message}`);
         return;
       }
+      if (i < batches.length - 1) await sleep(5000);
     }
 
     setStatus("done");
+    Swal.fire({
+      icon: "success",
+      title: `Submitted ${batches.length} batch${batches.length > 1 ? "es" : ""}`,
+      text: "They're processing in the background on ExportComments. Grab the finished files from your ExportComments dashboard once they're ready.",
+    });
   }
 
   // Fetches files with a bounded lookahead window and yields each Response as soon as it's ready.
@@ -432,7 +397,7 @@ export default function BatchExporter() {
     const prefix = batchCount > 1 ? `Batch ${batchIndex}/${batchCount} — ` : "";
     switch (status) {
       case "submitting":
-        return `${prefix}Submitting…`;
+        return `${prefix}Submitting batches…`;
       case "polling":
         return `${prefix}Processing… ${progress ? `${progress.progress_pct}%` : ""}`;
       case "fetching-links":
@@ -448,18 +413,7 @@ export default function BatchExporter() {
 
   return (
     <>
-      <div
-        style={{
-          position: "sticky",
-          top: 0,
-          zIndex: 10,
-          display: "flex",
-          justifyContent: "flex-end",
-          padding: "10px 20px",
-          background: "var(--card-bg, #ffffff)",
-          borderBottom: "1px solid #e5e5e5",
-        }}
-      >
+      <div className={styles.topbar}>
         <button
           type="button"
           className={styles.button}
