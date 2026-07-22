@@ -7,11 +7,17 @@ import styles from "./BatchExporter.module.css";
 import { parseCSV, csvField } from "./csvUtils";
 
 const BATCH_SIZE = 25;
+// Terminal export statuses per the ExportComments API (docs.exportcomments.com/jobs). An export is
+// "settled" only in one of these; anything else (queueing, progress, in_progress, requeueing, or an
+// unknown future status) counts as still working, so we never call a run done prematurely.
+const TERMINAL_STATUSES = new Set(["done", "error", "stopped"]);
 const ZIP_CONCURRENCY = 6;
 const TOKEN_STORAGE_KEY = "bulkExporter.token";
 const URLS_STORAGE_KEY = "bulkExporter.urlsRaw";
 const REPLIES_STORAGE_KEY = "bulkExporter.replies";
 const RESULTS_STORAGE_KEY = "bulkExporter.results";
+// batchIds of the last submitted run — persisted so exports can be re-downloaded in a fresh tab.
+const BATCHIDS_STORAGE_KEY = "bulkExporter.batchIds";
 
 type Status = "idle" | "submitting" | "polling" | "fetching-links" | "done" | "error";
 
@@ -91,6 +97,8 @@ export default function BatchExporter() {
   const [onlyWithComments, setOnlyWithComments] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchScope, setSearchScope] = useState<SearchScope>("both");
+  const [savedBatchIds, setSavedBatchIds] = useState<string[]>([]);
+  const [recovering, setRecovering] = useState(false);
 
   // Shared by the manual "Check token" button and the pre-flight check before each batch.
   async function validateToken(authHeader: string): Promise<{ ok: boolean; message: string }> {
@@ -125,6 +133,12 @@ export default function BatchExporter() {
     if (savedResults) {
       try {
         setResults(JSON.parse(savedResults));
+      } catch {}
+    }
+    const savedIds = localStorage.getItem(BATCHIDS_STORAGE_KEY);
+    if (savedIds) {
+      try {
+        setSavedBatchIds(JSON.parse(savedIds));
       } catch {}
     }
   }, []);
@@ -264,9 +278,9 @@ export default function BatchExporter() {
   const batches = chunk(urls, BATCH_SIZE);
   const isBusy = status === "submitting" || status === "polling" || status === "fetching-links";
 
-  // Fire-and-forget: submit every batch to ExportComments spaced 5s apart, then stop. The jobs
-  // run in the background on their servers — no client-side polling to babysit or time out. Grab
-  // the finished files from your ExportComments dashboard once they're done.
+  // Submit every batch to ExportComments 2 min apart, then poll the jobs list in the browser until
+  // every submitted export finishes, and auto-download the whole lot as one combined ZIP. Tab must
+  // stay open for the duration — the loop lives here, not on the server.
   async function run() {
     setErrorMsg("");
     setResults([]);
@@ -283,7 +297,13 @@ export default function BatchExporter() {
     const check = await validateToken(authHeader);
     if (!check.ok) return setErrorMsg(`Token check failed: ${check.message}`);
 
+    // 1. Submit all batches, 2 min apart. Remember each batchId and how many exports it should have.
+    // batchIds are persisted after every submit, so a run interrupted by a tab close is still
+    // recoverable via the "Download completed exports" button.
     setStatus("submitting");
+    const expectedByBatch: Record<string, number> = {};
+    localStorage.setItem(BATCHIDS_STORAGE_KEY, "[]");
+    setSavedBatchIds([]);
     for (let i = 0; i < batches.length; i++) {
       if (cancelRef.current) return setStatus("idle");
       setBatchIndex(i + 1);
@@ -295,21 +315,80 @@ export default function BatchExporter() {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || `Submit failed (${res.status})`);
-        if (i === 0) window.open("https://app.exportcomments.com/user/exports", "_blank", "noopener");
+        if (data.batchId) {
+          expectedByBatch[data.batchId] = batches[i].length;
+          const ids = Object.keys(expectedByBatch);
+          localStorage.setItem(BATCHIDS_STORAGE_KEY, JSON.stringify(ids));
+          setSavedBatchIds(ids);
+        }
       } catch (e: any) {
         setStatus("error");
         setErrorMsg(`Batch ${i + 1}/${batches.length} submit failed: ${e.message}`);
         return;
       }
-      if (i < batches.length - 1) await sleep(5000);
+      if (i < batches.length - 1) await sleep(2 * 60 * 1000);
     }
 
+    const batchIds = Object.keys(expectedByBatch);
+    if (batchIds.length === 0) {
+      setStatus("error");
+      setErrorMsg("No batch IDs returned — cannot track or download exports.");
+      return;
+    }
+
+    // 2. Poll the jobs list until every batch's exports are all out of a pending state.
+    setStatus("polling");
+    const totalExpected = Object.values(expectedByBatch).reduce((a, b) => a + b, 0);
+    let allJobs: ResultItem[] = [];
+    while (true) {
+      if (cancelRef.current) return setStatus("idle");
+      const byBatch = await fetchMyJobs(authHeader, new Set(batchIds));
+      allJobs = batchIds.flatMap((id) => byBatch[id] ?? []);
+      setResults([...allJobs]);
+      const settled = allJobs.filter((j) => TERMINAL_STATUSES.has(j.status)).length;
+      setProgress({
+        done: allJobs.filter((j) => j.status === "done").length,
+        error: allJobs.filter((j) => j.status === "error").length,
+        in_progress: allJobs.length - settled,
+        progress_pct: totalExpected ? Math.round((settled / totalExpected) * 100) : 0,
+      });
+      const allBatchesDone = batchIds.every((id) => {
+        const mine = byBatch[id] ?? [];
+        return mine.length >= expectedByBatch[id] && mine.every((e) => TERMINAL_STATUSES.has(e.status));
+      });
+      if (allBatchesDone) break;
+      await sleep(15000);
+    }
+
+    // 3. Everything settled — download all successful exports as one combined ZIP.
     setStatus("done");
-    Swal.fire({
-      icon: "success",
-      title: `Submitted ${batches.length} batch${batches.length > 1 ? "es" : ""}`,
-      text: "They're processing in the background on ExportComments. Grab the finished files from your ExportComments dashboard once they're ready.",
-    });
+    await downloadAllAsZip(allJobs);
+  }
+
+  // Pages through the jobs list and returns our exports grouped by batch_id. Our batches are the
+  // most recent, so a few pages of 100 cover them; stop on a short/empty page.
+  async function fetchMyJobs(authHeader: string, wanted: Set<string>): Promise<Record<string, ResultItem[]>> {
+    const grouped: Record<string, ResultItem[]> = {};
+    for (let page = 1; page <= 30; page++) {
+      const r = await fetch(`/api/jobs?page=${page}&limit=100`, { headers: { Authorization: authHeader } });
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "Failed to fetch jobs");
+      const items = d.items || [];
+      for (const it of items) {
+        const batchId = it.comment.batch_id;
+        if (!wanted.has(batchId)) continue;
+        (grouped[batchId] ??= []).push({
+          url: it.comment.url,
+          status: it.comment.status,
+          totalExported: it.comment.total_exported ?? 0,
+          downloadUrl: it.comment.download_url ?? it.comment.download_link ?? null,
+          fileName: it.comment.file_name ?? it.comment.rawFile ?? null,
+          error: it.comment.error ?? null,
+        });
+      }
+      if (items.length < 100) break;
+    }
+    return grouped;
   }
 
   // Fetches files with a bounded lookahead window and yields each Response as soon as it's ready.
@@ -354,8 +433,9 @@ export default function BatchExporter() {
     }
   }
 
-  async function downloadAllAsZip() {
-    const downloadable = results.filter((r) => r.status === "done" && r.downloadUrl);
+  async function downloadAllAsZip(items?: ResultItem[]) {
+    const source = items ?? results;
+    const downloadable = source.filter((r) => r.status === "done" && r.downloadUrl);
     if (downloadable.length === 0) return;
 
     setZipping(true);
@@ -393,6 +473,36 @@ export default function BatchExporter() {
     setZipping(false);
   }
 
+  // Recovery path: re-fetch the last run's exports from the jobs list (persisted batchIds survive a
+  // tab close) and download whatever's finished. Works in a fresh tab hours/days later.
+  async function downloadSavedExports() {
+    setErrorMsg("");
+    if (!token.trim()) return setErrorMsg("Paste your bearer token first.");
+    if (savedBatchIds.length === 0) return setErrorMsg("No previous batches saved on this browser.");
+
+    const authHeader = token.trim().startsWith("Bearer ") ? token.trim() : `Bearer ${token.trim()}`;
+    setRecovering(true);
+    try {
+      const byBatch = await fetchMyJobs(authHeader, new Set(savedBatchIds));
+      const all = savedBatchIds.flatMap((id) => byBatch[id] ?? []);
+      setResults([...all]);
+      const ready = all.filter((r) => r.status === "done" && r.downloadUrl).length;
+      const pending = all.filter((r) => !TERMINAL_STATUSES.has(r.status)).length;
+      if (ready === 0) {
+        setErrorMsg(pending > 0 ? `Nothing ready yet — ${pending} export(s) still processing.` : "No completed exports found for your saved batches.");
+        return;
+      }
+      if (pending > 0) {
+        setErrorMsg(`Downloading ${ready} finished export(s); ${pending} still processing — run this again later for the rest.`);
+      }
+      await downloadAllAsZip(all);
+    } catch (e: any) {
+      setErrorMsg(`Recovery failed: ${e.message}`);
+    } finally {
+      setRecovering(false);
+    }
+  }
+
   function statusLabel() {
     const prefix = batchCount > 1 ? `Batch ${batchIndex}/${batchCount} — ` : "";
     switch (status) {
@@ -428,7 +538,7 @@ export default function BatchExporter() {
         <div className={styles.card}>
           <header className={styles.header}>
             <h1>Bulk Comment Exporter</h1>
-            <p>Paste any number of URLs — they&apos;re split into batches of {BATCH_SIZE} and processed one at a time.</p>
+            <p>Paste any number of URLs — they&apos;re split into batches of {BATCH_SIZE}, submitted 2 min apart, then auto-downloaded together as one ZIP when all finish. Keep this tab open.</p>
           </header>
 
           <label
@@ -630,6 +740,20 @@ export default function BatchExporter() {
             {isBusy ? statusLabel() : "Submit"}
           </button>
 
+          {savedBatchIds.length > 0 && !isBusy && (
+            <button
+              type="button"
+              className={styles.button}
+              style={{ marginTop: 10, background: "transparent", color: "#6366f1", border: "1px solid #c7d2fe" }}
+              onClick={downloadSavedExports}
+              disabled={recovering}
+            >
+              {recovering
+                ? "Fetching your exports…"
+                : `Download completed exports (${savedBatchIds.length} batch${savedBatchIds.length === 1 ? "" : "es"})`}
+            </button>
+          )}
+
           {status === "polling" && progress && (
             <div className={styles.progressBarTrack}>
               <div className={styles.progressBarFill} style={{ width: `${progress.progress_pct}%` }} />
@@ -663,7 +787,7 @@ export default function BatchExporter() {
                 type="button"
                 className={styles.button}
                 style={{ marginBottom: 16 }}
-                onClick={downloadAllAsZip}
+                onClick={() => downloadAllAsZip()}
                 disabled={zipping || results.filter((r) => r.status === "done" && r.downloadUrl).length === 0}
               >
                 {zipping
